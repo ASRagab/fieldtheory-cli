@@ -1,7 +1,32 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { Command } from 'commander';
 import { addLlmEngineOption, buildCli } from '../src/cli.js';
+
+function runCli(args: string[], ftDataDir: string) {
+  const result = spawnSync(
+    process.execPath,
+    ['node_modules/tsx/dist/cli.mjs', 'src/cli.ts', ...args],
+    {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        FT_DATA_DIR: ftDataDir,
+        PATH: '/usr/bin:/bin',
+      },
+    },
+  );
+
+  return {
+    ...result,
+    output: `${result.stdout ?? ''}${result.stderr ?? ''}`,
+  };
+}
 
 describe('addLlmEngineOption', () => {
   test('parses explicit engine values and defaults to auto', () => {
@@ -45,5 +70,31 @@ describe('buildCli', () => {
     }
 
     assert.doesNotMatch(viz.helpInformation(), /--engine <engine>/);
+  });
+
+  test('sync --classify with default auto engine does not fail fast before sync starts', () => {
+    const ftDataDir = mkdtempSync(path.join(tmpdir(), 'ft-cli-'));
+
+    try {
+      const result = runCli(['sync', '--api', '--classify'], ftDataDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.output, /No supported LLM CLI found/);
+      assert.match(result.output, /Missing user-context OAuth token\. Run: ft auth/);
+    } finally {
+      rmSync(ftDataDir, { recursive: true, force: true });
+    }
+  });
+
+  test('sync --classify with an explicit engine still fails fast when unavailable', () => {
+    const ftDataDir = mkdtempSync(path.join(tmpdir(), 'ft-cli-'));
+
+    try {
+      const result = runCli(['sync', '--api', '--classify', '--engine', 'claude'], ftDataDir);
+      assert.notEqual(result.status, 0);
+      assert.match(result.output, /Requested LLM engine "claude" is not available/);
+      assert.doesNotMatch(result.output, /Missing user-context OAuth token\. Run: ft auth/);
+    } finally {
+      rmSync(ftDataDir, { recursive: true, force: true });
+    }
   });
 });

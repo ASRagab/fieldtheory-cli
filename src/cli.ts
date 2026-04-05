@@ -267,7 +267,7 @@ export function buildCli() {
         const useApi = Boolean(options.api);
         const mode = Boolean(options.full) ? 'full' : 'incremental';
         const llmEngine = (options.engine ?? 'auto') as LlmEngineSelection;
-        if (options.classify) resolveLlmEngine(llmEngine);
+        if (options.classify && llmEngine !== 'auto') resolveLlmEngine(llmEngine);
 
         if (useApi) {
           const result = await syncTwitterBookmarks(mode, {
