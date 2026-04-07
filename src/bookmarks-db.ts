@@ -800,6 +800,27 @@ export async function updateQuotedTweets(
   }
 }
 
+export async function updateBookmarkText(
+  records: Array<{ id: string; text: string }>,
+): Promise<void> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+
+  try {
+    const stmt = db.prepare('UPDATE bookmarks SET text = ? WHERE id = ?');
+    for (const record of records) {
+      stmt.run([record.text, record.id]);
+    }
+    stmt.free();
+    // Rebuild FTS to reflect updated text
+    db.run("INSERT INTO bookmarks_fts(bookmarks_fts) VALUES('rebuild')");
+    saveDb(db, dbPath);
+  } finally {
+    db.close();
+  }
+}
+
 export function formatSearchResults(results: SearchResult[]): string {
   if (results.length === 0) return 'No results found.';
 

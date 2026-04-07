@@ -121,8 +121,8 @@ async function checkForUpdate(): Promise<void> {
 
 const WHATS_NEW: Record<string, string[]> = {
   '1.3.0': [
-    'ft sync --gaps \u2014 backfill missing quoted tweets for existing bookmarks',
-    'Quoted tweet content now captured automatically during sync',
+    'ft sync --gaps \u2014 backfill missing quoted tweets and expand truncated articles',
+    'Quoted tweet content and full article text now captured automatically during sync',
     'Bookmark date (when you bookmarked, not just when it was posted) now tracked',
     'ft sync --rebuild replaces --full',
     'Update notifications when a new version is available',
@@ -350,7 +350,7 @@ export function buildCli() {
     .description('Sync bookmarks from X into your local database')
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
     .option('--rebuild', 'Full re-crawl of all bookmarks', false)
-    .option('--gaps', 'Backfill missing data (quoted tweets, bookmark dates)', false)
+    .option('--gaps', 'Backfill missing data (quoted tweets, truncated articles)', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 500)
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -373,24 +373,25 @@ export function buildCli() {
         // ── gaps mode: backfill missing data for existing bookmarks ──
         if (options.gaps) {
           const startTime = Date.now();
-          process.stderr.write('  Filling gaps (quoted tweets, bookmark dates)...\n');
+          process.stderr.write('  Filling gaps (quoted tweets, truncated text)...\n');
           const result = await syncGaps({
             delayMs: Number(options.delayMs) || 300,
             onProgress: (progress: GapFillProgress) => {
               const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
               const elapsed = Math.round((Date.now() - startTime) / 1000);
               const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-              process.stderr.write(`\r\x1b[K  ${spin} ${progress.done}/${progress.total} (${pct}%) \u2502 ${progress.quotedFetched} quoted tweets \u2502 ${progress.failed} unavailable \u2502 ${elapsed}s`);
+              process.stderr.write(`\r\x1b[K  ${spin} ${progress.done}/${progress.total} (${pct}%) \u2502 ${progress.quotedFetched} quoted \u2502 ${progress.textExpanded} expanded \u2502 ${progress.failed} failed \u2502 ${elapsed}s`);
             },
           });
           process.stderr.write('\n');
           if (result.total === 0) {
             console.log('  No gaps found \u2014 all bookmarks are fully enriched.');
           } else {
-            console.log(`  \u2713 ${result.quotedTweetsFilled} quoted tweets filled`);
+            if (result.quotedTweetsFilled > 0) console.log(`  \u2713 ${result.quotedTweetsFilled} quoted tweets filled`);
+            if (result.textExpanded > 0) console.log(`  \u2713 ${result.textExpanded} truncated texts expanded`);
             if (result.failed > 0) console.log(`  ${result.failed} unavailable (deleted or private)`);
-            if (result.bookmarkedAtFilled > 0) {
-              console.log(`  ${result.bookmarkedAtFilled} bookmarks missing bookmark date \u2014 run ft sync to fill`);
+            if (result.bookmarkedAtMissing > 0) {
+              console.log(`  ${result.bookmarkedAtMissing} bookmarks missing bookmark date \u2014 run ft sync to fill`);
             }
           }
           return;

@@ -3,7 +3,7 @@ import { ensureDataDir, twitterBookmarksCachePath, twitterBookmarksMetaPath, twi
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkRecord, QuotedTweetSnapshot } from './types.js';
-import { exportBookmarksForSyncSeed, updateQuotedTweets } from './bookmarks-db.js';
+import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText } from './bookmarks-db.js';
 
 const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
@@ -613,17 +613,21 @@ async function fetchTweetViaSyndication(tweetId: string): Promise<QuotedTweetSna
   return null;
 }
 
+// Text >= 275 chars may be truncated by Twitter's legacy.full_text limit
+const TRUNCATION_THRESHOLD = 275;
+
 export interface GapFillProgress {
   done: number;
   total: number;
   quotedFetched: number;
-  bookmarkedAtFilled: number;
+  textExpanded: number;
   failed: number;
 }
 
 export interface GapFillResult {
   quotedTweetsFilled: number;
-  bookmarkedAtFilled: number;
+  textExpanded: number;
+  bookmarkedAtMissing: number;
   failed: number;
   total: number;
 }
@@ -636,28 +640,32 @@ export async function syncGaps(options?: {
   const cachePath = twitterBookmarksCachePath();
   const records = await readJsonLines<BookmarkRecord>(cachePath);
 
-  // Find bookmarks missing quoted tweets
+  // Gap 1: missing quoted tweets
   const needsQuotedTweet = records.filter((r) => r.quotedStatusId && !r.quotedTweet);
-  const uniqueQuotedIds = [...new Set(needsQuotedTweet.map((r) => r.quotedStatusId!))];
+  const quotedIds = new Set(needsQuotedTweet.map((r) => r.quotedStatusId!));
 
-  // Find bookmarks missing bookmarkedAt (can't backfill via syndication — only from timeline)
-  const needsBookmarkedAt = records.filter((r) => !r.bookmarkedAt);
+  // Gap 2: potentially truncated text (articles/long notes cut off by legacy.full_text)
+  const maybeTruncated = records.filter((r) => (r.text?.length ?? 0) >= TRUNCATION_THRESHOLD);
+  const truncatedIds = new Set(maybeTruncated.map((r) => r.tweetId));
 
-  const total = uniqueQuotedIds.length;
+  // Combine all IDs to fetch — deduplicated
+  const allFetchIds = [...new Set([...quotedIds, ...truncatedIds])];
+  const total = allFetchIds.length;
+
+  const fetched = new Map<string, QuotedTweetSnapshot | null>();
   let quotedFetched = 0;
+  let textExpanded = 0;
   let failed = 0;
 
-  const quotedIdToSnapshot = new Map<string, QuotedTweetSnapshot | null>();
-
-  for (let i = 0; i < uniqueQuotedIds.length; i++) {
-    const quotedId = uniqueQuotedIds[i];
+  // Fetch all needed tweets in one pass
+  for (let i = 0; i < allFetchIds.length; i++) {
+    const tweetId = allFetchIds[i];
     try {
-      const snapshot = await fetchTweetViaSyndication(quotedId);
-      quotedIdToSnapshot.set(quotedId, snapshot);
-      if (snapshot) quotedFetched++;
-      else failed++;
+      const snapshot = await fetchTweetViaSyndication(tweetId);
+      fetched.set(tweetId, snapshot);
+      if (!snapshot) failed++;
     } catch {
-      quotedIdToSnapshot.set(quotedId, null);
+      fetched.set(tweetId, null);
       failed++;
     }
 
@@ -665,39 +673,48 @@ export async function syncGaps(options?: {
       done: i + 1,
       total,
       quotedFetched,
-      bookmarkedAtFilled: 0,
+      textExpanded,
       failed,
     });
 
-    if (i < uniqueQuotedIds.length - 1) {
+    if (i < allFetchIds.length - 1) {
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
-  // Apply quoted tweet snapshots to records
+  // Apply results
   const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
+  const dbTextUpdates: Array<{ id: string; text: string }> = [];
+
   for (const record of records) {
+    // Apply quoted tweet snapshots
     if (record.quotedStatusId && !record.quotedTweet) {
-      const snapshot = quotedIdToSnapshot.get(record.quotedStatusId);
+      const snapshot = fetched.get(record.quotedStatusId);
       if (snapshot) {
         record.quotedTweet = snapshot;
         dbQuotedUpdates.push({ id: record.id, quotedTweet: snapshot });
+        quotedFetched++;
+      }
+    }
+
+    // Apply expanded text (only if syndication returned longer text)
+    if ((record.text?.length ?? 0) >= TRUNCATION_THRESHOLD) {
+      const snapshot = fetched.get(record.tweetId);
+      if (snapshot && snapshot.text.length > (record.text?.length ?? 0)) {
+        record.text = snapshot.text;
+        dbTextUpdates.push({ id: record.id, text: snapshot.text });
+        textExpanded++;
       }
     }
   }
 
-  // Write updated JSONL cache
+  // Find bookmarks missing bookmarkedAt (filled on next sync, not via syndication)
+  const bookmarkedAtMissing = records.filter((r) => !r.bookmarkedAt).length;
+
+  // Persist
   await writeJsonLines(cachePath, records);
+  if (dbQuotedUpdates.length > 0) await updateQuotedTweets(dbQuotedUpdates);
+  if (dbTextUpdates.length > 0) await updateBookmarkText(dbTextUpdates);
 
-  // Update SQLite
-  if (dbQuotedUpdates.length > 0) {
-    await updateQuotedTweets(dbQuotedUpdates);
-  }
-
-  return {
-    quotedTweetsFilled: dbQuotedUpdates.length,
-    bookmarkedAtFilled: needsBookmarkedAt.length, // reported for awareness — filled on next sync
-    failed,
-    total,
-  };
+  return { quotedTweetsFilled: quotedFetched, textExpanded, bookmarkedAtMissing, failed, total };
 }
